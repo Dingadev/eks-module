@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+"""Script to format the associated tags on the EC2 instance for passing to kubelet to set as node labels.
+
+This script will read in the EC2 tags from the metadata API and convert it to a string of comma separated key=value
+pairs, outputting the result to stdout.
+
+Note: unlike EC2 tags, Kubernetes node labels have the following restrictions on BOTH keys and labels:
+- Must be 63 characters or less
+- Begin and end with an alphanumeric character ([a-zA-Z0-9])
+- Only contain dashes (-), underscores (_), dots (.), and alphanumeric characters ([a-zA-Z0-9])
+
+As such, this script will convert the EC2 tags to fit the scheme above. Notably, this script will:
+- Take all unsupported characters and replace them with dashes (-). E.g if you have a EC2 tag with key "foo@bar", this
+  will be converted to "foo-bar".
+- Truncate keys and values to 63 characters.
+- Namespace the labels with the prefix `ec2.amazonaws.com`. E.g if you have a EC2 tag with key "foo", this will be
+  registered under the key "ec2.amazonaws.com/foo" in Kubernetes.
+
+This script will log all conversions to stderr so it can be traced and referenced.
+
+This script has the following prerequisites:
+
+1. It must be run on an EC2 instance.
+2. The EC2 instance must be running an Amazon EKS-optimized AMI.
+3. The EC2 instance must have the AWS CLI installed.
+4. The EC2 instance must have a version of Python installed.
+"""
+
+from __future__ import print_function
+import argparse
+import logging
+import re
+import time
+
+# NOTE: both requests and botocore are installed as part of the AWS CLI. We use botocore directly to avoid managing the
+# boto3 dependency, which is not pulled in as part of the AWS CLI.
+import requests
+import botocore.session
+from botocore.utils import InstanceMetadataFetcher
+from botocore.credentials import InstanceMetadataProvider
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Global objects. Should only include objects that should only be defined once in the script.
+# ----------------------------------------------------------------------------------------------------------------------
+
+# logger for the script
+logger = logging.getLogger('map-ec2-tags-to-node-labels')
+LOG_LEVEL_MAP = {
+    'debug': logging.DEBUG,
+    'info': logging.INFO,
+    'warn': logging.WARNING,
+    'error': logging.ERROR,
+}
+
+# ----------------------------------------------------------------------------------------------------------------------
+# CLI functions. Functions to help build up the CLI.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def main():
+    """
+    The main entrypoint function for the CLI
+    """
+    args = parse_args()
+    configure_logger(args.loglevel)
+
+    # Get the tags and format it as node labels. Then print it out.
+    tags = get_ec2_instance_tags(args.tag_prefix)
+    node_labels = format_tags_as_node_labels(tags)
+    print(node_labels)
+
+
+def parse_args():
+    """
+    CLI argument parser
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument(
+        '--loglevel',
+        default='info',
+        choices=LOG_LEVEL_MAP.keys(),
+        help='Logging verbosity level.',
+    )
+
+    parser.add_argument(
+        '--tag-prefix',
+        default='',
+        help=(
+            'Specify a prefix for EC2 tag keys to map to node labels. Only EC2 tags with this prefix will be mapped. '
+            'Useful when you are using cluster-autoscaler to ensure that every node in the group has the same labels.'
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def configure_logger(loglevel):
+    """
+    Configures the logging settings to log more information than default and set the appropriate log level.
+
+    Args:
+        loglevel (string) : Friendly name for log level (e.g info).
+    """
+    formatter = logging.Formatter(
+        fmt='%(levelname)-8s %(asctime)s  %(name)-28s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(LOG_LEVEL_MAP[loglevel])
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# AWS functions. Functions to help interface with AWS.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def get_instance_id():
+    """
+    Retrieve the AWS ID of the EC2 instance this script is running on by querying the EC2 metadata.
+    Uses Instance Metadata Service version 2.
+
+    Returns:
+        A string representing the EC2 instance ID of the running instance.
+    """
+    logger.info('Retrieving EC2 instance ID from the metadata endpoint.')
+    imdsv2_token_url = 'http://169.254.169.254/latest/api/token'
+    token_resp = requests.put(imdsv2_token_url, headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
+    token_resp.raise_for_status()
+    token = token_resp.text
+    metadata_url = 'http://169.254.169.254/latest/meta-data/instance-id'
+    resp = requests.get(metadata_url, headers={"X-aws-ec2-metadata-token": token})
+    resp.raise_for_status()
+    instance_id = resp.text
+    logger.info('Successfully retrieved the EC2 instance ID ({}) from the metadata endpoint.'.format(instance_id))
+    return instance_id
+
+
+def get_region():
+    """
+    Retrieve the deployed region of the EC2 instance this script is running on by querying the EC2 metadata.
+    Uses Instance Metadata Service version 2.
+
+    Returns:
+        A string representing the region of the deployed EC2 instance the script is running on.
+    """
+    logger.info('Retrieving deployed availability zone from the metadata endpoint.')
+
+    imdsv2_token_url = 'http://169.254.169.254/latest/api/token'
+    token_resp = requests.put(imdsv2_token_url, headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
+    token_resp.raise_for_status()
+    token = token_resp.text
+    metadata_url = 'http://169.254.169.254/latest/meta-data/placement/availability-zone'
+    resp = requests.get(metadata_url, headers={"X-aws-ec2-metadata-token": token})
+    resp.raise_for_status()
+    availability_zone = resp.text
+    logger.info(
+        'Successfully retrieved the deployed availability zone ({}) from the metadata endpoint.'
+        .format(availability_zone)
+    )
+    region = availability_zone[:-1]
+    logger.info('Converted availability zone {} to region {}'.format(availability_zone, region))
+    return region
+
+
+def get_ec2_client(region):
+    """
+    Returns a botocore ec2 client for the provided region.
+
+    Args:
+        region (str) : A string representing the deployed region of the EC2 instance (e.g us-east-1).
+
+    Returns:
+        botocore.EC2.Client object configured for the provided region.
+    """
+    # Fetch temporary credentials from the EC2 instance metadata
+    fetcher = InstanceMetadataFetcher()
+    provider = InstanceMetadataProvider(iam_role_fetcher=fetcher)
+    tmp_creds = provider.load()
+
+    # ... and setup client with the temporary credentials
+    session = botocore.session.get_session()
+    client = session.create_client(
+        'ec2',
+        region_name=region,
+        aws_access_key_id=tmp_creds.access_key,
+        aws_secret_access_key=tmp_creds.secret_key,
+        aws_session_token=tmp_creds.token,
+    )
+    return client
+
+
+def get_ec2_instance_tags(tag_prefix):
+    """
+    Retrieves the associated tags of the deployed EC2 instance the script is running on.
+
+    This will:
+
+    1. Retrieve the region the EC2 instance is deployed into from the EC2 metadata.
+    2. Retrieve the instance ID from the EC2 metadata.
+    3. Query the AWS API for the tags associated with the EC2 instance.
+
+    Args:
+        tag_prefix (str) : A string representing prefix for querying tag keys. Only EC2 tags with this prefix will be
+                           retrieved.
+
+    Returns:
+        A dictionary representation of the EC2 instance tags.
+    """
+    instance_id = get_instance_id()
+    region = get_region()
+    ec2 = get_ec2_client(region)
+
+    logger.info('Retrieving tags for instance {}'.format(instance_id))
+    tag_list = []
+    tags_resp = ec2.describe_tags(Filters=[
+        {
+            'Name': 'resource-id',
+            'Values': [instance_id],
+        },
+    ])
+    tag_list += __filter_tags(tags_resp['Tags'], tag_prefix)
+    while tags_resp.get('NextToken', None):
+        logger.info('Detected paging. Retrieving next page of tags.')
+        tags_resp = ec2.describe_tags(NextToken=tags_resp['NextToken'])
+        tag_list += __filter_tags(tags_resp['Tags'], tag_prefix)
+        logger.info('Pausing for 500 milliseconds to avoid rate limit')
+        time.sleep(0.5)
+
+    logger.info('Found {} tags attached to the instance'.format(len(tag_list)))
+
+    tags = {tag['Key']: tag['Value'] for tag in tag_list}
+    logger.debug('Detected tags: {}'.format(tags))
+    return tags
+
+
+def __filter_tags(tags, tag_prefix):
+    return [tag for tag in tags if tag['Key'].startswith(tag_prefix)]
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Formatting functions. Functions that format the tags in prep to be used as node labels.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def format_string_for_node_label(val):
+    """
+    Formats the given string value to conform to the rules of a Kubernetes label:
+
+    - Must be 63 characters or less
+    - Begin and end with an alphanumeric character ([a-zA-Z0-9])
+    - Only contain dashes (-), underscores (_), dots (.), and alphanumeric characters ([a-zA-Z0-9])
+
+    This will:
+    - Truncate values to 63 characters.
+    - Take all unsupported characters and replace them with dashes (-). E.g if you have a value "foo@bar" this will be
+      converted to "foo-bar".
+    - Drop leading and trailing non-alphanumeric characters.
+
+    Args:
+        val (str) : String value to be formatted.
+
+    Returns:
+        The formatted value as a string.
+    """
+    # Replace unsupported characters
+    out_val = re.sub(r'[^0-9A-Za-z-_.]', '-', val)
+
+    # Truncate to 63 characters
+    out_val = out_val[:63]
+
+    # If leading or trailing non-alphanumeric character, drop it
+    out_val = re.sub(r'^[^0-9a-zA-Z]*([0-9a-zA-Z-_.]+[0-9a-zA-Z])[^0-9a-zA-Z]*$', '\g<1>', out_val)
+
+    return out_val
+
+
+def format_tags_as_node_labels(tags):
+    """
+    Takes EC2 instance tags (encoded as a dict) and converts them to comma separated key=val list of labels.
+
+    In this process, the tags will be formatted into an encoding that Kubernetes likes. See format_string_for_node_label
+    for more details.
+
+    Additionally, all the keys will be prefixed with `ec2.amazonaws.com/` for namespacing purposes.
+
+    Args:
+        tags (dict) : A dictionary encoding the EC2 tags, where the keys and values are those in the tag.
+
+    Returns:
+        A string encoding the tags as comma separated key=value list.
+    """
+    logger.info('Formatting EC2 tags as K8S node labels')
+
+    formatted_tags = []
+    # Iterate in sorted order to make the output deterministic. Helps with testing.
+    for key in sorted(tags.keys()):
+        formatted_key = 'ec2.amazonaws.com/{}'.format(format_string_for_node_label(key))
+        formatted_value = format_string_for_node_label(tags[key])
+        formatted_pair = '{}={}'.format(formatted_key, formatted_value)
+        formatted_tags.append(formatted_pair)
+        logger.info('Formatted {}={} as {}'.format(key, tags[key], formatted_pair))
+    node_labels = ','.join(formatted_tags)
+    logger.info('Done formatting tags')
+    logger.debug('Formatted tags {} as node labels {}'.format(tags, node_labels))
+    return node_labels
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Script execution block that calls the main function.
+# ----------------------------------------------------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    main()

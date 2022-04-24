@@ -1,0 +1,113 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.15.7
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - "echo 1 > /usr/share/nginx/html/is-alive.txt && nginx -g 'daemon off;'"
+        volumeMounts:
+        - mountPath: /usr/share/nginx/html/server_text.txt
+          name: server-text
+        ports:
+        - containerPort: 80
+        - containerPort: 443
+        # We add a controllable readiness probe so that we can stop routing traffic during a shutdown event.
+        # This example uses an nginx route that leads to a file on the server that is removed during a shutdown event.
+        # This was inspired by https://stackoverflow.com/a/40625106
+        readinessProbe:
+          httpGet:
+            path: /is-alive.txt
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 1
+        lifecycle:
+          # Gracefully terminate by first causing the readiness probe to fail, and then waiting 5 seconds for it to
+          # propagate, and then quitting the process.
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              # First, remove the file backing the readiness probe so that it fails and the container is cycled out of the service
+              # Then, sleep for 5 seconds to allow the probe a chance to pick up the change.
+              # Finally, send signal to shutdown to nginx
+              - "rm /usr/share/nginx/html/is-alive.txt && sleep 5 && /usr/sbin/nginx -s quit"
+
+      volumes:
+      - name: server-text
+        hostPath:
+          path: /var/log/server_text.txt
+          type: File
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: nginx-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: nginx
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: nginx-service
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    targetPort: 80
+    port: 80
+  type: LoadBalancer
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: nginx-service-nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  selector:
+    app: nginx
+  ports:
+  - name: http
+    protocol: TCP
+    targetPort: 80
+    port: 80
+  - name: https
+    protocol: TCP
+    targetPort: 443
+    port: 443
+  type: LoadBalancer
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: nginx-service-internal
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    targetPort: 80
+    port: 80
+  type: LoadBalancer

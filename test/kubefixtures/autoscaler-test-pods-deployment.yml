@@ -1,0 +1,22 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaler-test-deployment
+spec:
+  selector:
+    matchLabels:
+      app: autoscaler-test
+  # We need enough replicas to trigger a scale up event. The test cluster uses t3.medium instances, which has room for 17
+  # pods. Each node has 4 pods from DaemonSets, so each node has room for 13 pods. Since we have two of those, to trigger
+  # a scale up event we need to deploy >26 pods, so we choose 30
+  replicas: 30
+  template:
+    metadata:
+      labels:
+        app: autoscaler-test
+    spec:
+      containers:
+      - name: alpine-sleeper
+        image: alpine:3.10
+        command: ["sleep", "99999"]

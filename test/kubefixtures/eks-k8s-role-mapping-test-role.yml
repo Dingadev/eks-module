@@ -1,0 +1,31 @@
+---
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: example
+  labels:
+    name: example
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: example-role
+  namespace: example
+rules:
+- apiGroups: ["", "batch", "extensions", "apps"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-example
+  namespace: example
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: example-role
+subjects:
+- kind: Group
+  name: eks-k8s-role-mapping-test-group
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: list-eks-clusters-sa
+  annotations:
+    eks.amazonaws.com/role-arn: "%s"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: list-eks-clusters
+spec:
+  template:
+    spec:
+      serviceAccountName: list-eks-clusters-sa
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      containers:
+        - name: list-eks-clusters
+          image: "python:3-alpine"
+          command:
+            - sh
+            - -c
+            - "pip install awscli && aws eks --region %s list-clusters"
